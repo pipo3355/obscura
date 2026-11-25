@@ -1148,12 +1148,23 @@ async fn stop_worker(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
-async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
+/// Settle within `wait_secs`, following navigations the page starts itself
+/// (for example a challenge that reloads from a timer once solved). A failed
+/// follow-up navigation is reported and the current document is read as is.
+async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool, quiet: bool) {
     let wait_ms = wait_secs.saturating_mul(1000);
-    if fixed {
-        page.settle_for_duration(wait_ms).await;
-    } else {
-        page.settle(wait_ms).await;
+    match page.settle_following_navigations(wait_ms, fixed).await {
+        Ok(0) => {}
+        Ok(_) => {
+            if !quiet {
+                eprintln!("Page navigated: {} - \"{}\"", page.url_string(), page.title);
+            }
+        }
+        Err(e) => {
+            if !quiet {
+                eprintln!("Warning: page-initiated navigation failed: {}", operator_network_error(e));
+            }
+        }
     }
 }
 
@@ -1292,9 +1303,15 @@ async fn run_fetch(
         } else {
             1
         };
+        // A settle pass may end with one page-initiated navigation still in
+        // flight, bounded by the navigation timeout.
         let hard = Duration::from_secs(
             timeout_secs
-                .saturating_add(wait_secs.saturating_mul(settle_passes))
+                .saturating_add(
+                    wait_secs
+                        .saturating_add(timeout_secs)
+                        .saturating_mul(settle_passes),
+                )
                 .saturating_add(10),
         );
         std::thread::spawn(move || {
@@ -1331,7 +1348,7 @@ async fn run_fetch(
     // and completion callbacks (e.g. testharness's add_completion_callback) run
     // before we read the page. Returns early once the loop is idle, so static
     // pages stay fast.
-    settle_page(&mut page, wait_secs, wait_is_fixed).await;
+    settle_page(&mut page, wait_secs, wait_is_fixed, quiet).await;
 
     #[cfg(feature = "render")]
     let mut deferred_eval_output = None;
@@ -1354,7 +1371,7 @@ async fn run_fetch(
         None
     };
     if initial_controlled_scroll.is_some() {
-        settle_page(&mut page, wait_secs, wait_is_fixed).await;
+        settle_page(&mut page, wait_secs, wait_is_fixed, quiet).await;
     }
 
     if !eval_at_capture_boundary {
@@ -1388,7 +1405,7 @@ async fn run_fetch(
             // listener) that writes the DOM. Drive the event loop again so that
             // work completes, then fall through to selector/capture/dump instead
             // of returning the still-pending eval value (issue #248).
-            settle_page(&mut page, wait_secs, wait_is_fixed).await;
+            settle_page(&mut page, wait_secs, wait_is_fixed, quiet).await;
         }
     }
 

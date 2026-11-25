@@ -3425,7 +3425,7 @@ impl Page {
             {
                 self.queue_pending_render_resources();
             }
-            if !self.advance_frames().await {
+            if self.has_pending_navigation() || !self.advance_frames().await {
                 break;
             }
         }
@@ -3444,7 +3444,7 @@ impl Page {
                 settle_started.elapsed(),
                 warmup_ms,
             );
-            if remaining_ms != 0 {
+            if remaining_ms != 0 && !self.has_pending_navigation() {
                 let _ = self.prepare_screenshot_resources(remaining_ms).await;
             }
         }
@@ -3541,9 +3541,52 @@ impl Page {
         Ok(reached_idle && !frame_work)
     }
 
+    /// Settle the page for at most `max_ms` of wall clock (adaptively, or the
+    /// full duration when `fixed`), following navigations the document queues
+    /// itself meanwhile: a timer assigning `location`, `location.reload()`, a
+    /// scripted form submit. Each landed document settles in the remaining
+    /// budget. Challenge pages commonly solve a check and then reload from a
+    /// timer after `load`; without this the caller reads the challenge page.
+    /// Returns how many navigations were followed.
+    pub async fn settle_following_navigations(
+        &mut self,
+        max_ms: u64,
+        fixed: bool,
+    ) -> Result<usize, PageError> {
+        let started = std::time::Instant::now();
+        let limit = self.navigation_chain_limit();
+        let mut followed = 0;
+        loop {
+            let remaining = max_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            if remaining != 0 {
+                if fixed {
+                    self.settle_for_duration(remaining).await;
+                } else {
+                    self.settle(remaining).await;
+                }
+            }
+            if !self.has_pending_navigation() {
+                return Ok(followed);
+            }
+            if followed == limit {
+                self.take_pending_navigation();
+                return Err(PageError::TooManyClientNavigations(limit));
+            }
+            if self.process_pending_navigation_outcome().await? != PendingNavigationOutcome::Document {
+                return Ok(followed);
+            }
+            followed += 1;
+            tracing::info!("followed page-initiated navigation to {} ({:?})", self.url_string(), self.title);
+        }
+    }
+
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
         let started = tokio::time::Instant::now();
         let _ = js.run_event_loop_for_duration(duration_ms).await;
+        if js.has_pending_navigation() {
+            // The document is being replaced; the caller follows it.
+            return;
+        }
         let requested = tokio::time::Duration::from_millis(duration_ms);
         let elapsed = started.elapsed();
         if elapsed < requested {
@@ -7022,6 +7065,53 @@ mod tests {
         page.sync_history_updates();
         assert_eq!(page.url_string(), "http://example.com/kept");
         assert!(page.history.iter().all(|url| url.starts_with("http://example.com/")));
+    }
+
+    /// A document that replaces itself from a timer after `load` is followed
+    /// by settle, both adaptive and fixed, and the fixed wait ends early
+    /// instead of pumping the discarded document for the whole budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn settle_follows_a_timer_location_assignment_after_load() {
+        let next = "data:text/html,<title>next</title>";
+        let first = format!(
+            "data:text/html,<title>first</title><script>onload=()=>setTimeout(()=>{{location.href='{next}'}},100)</script>"
+        );
+        for fixed in [false, true] {
+            let mut page = page_without_chain_limit("settle-follows-location");
+            page.navigate(&first).await.unwrap();
+            assert_eq!(page.title, "first");
+            let started = std::time::Instant::now();
+            let followed = page.settle_following_navigations(3_000, fixed).await.unwrap();
+            assert_eq!(followed, 1, "fixed={fixed}");
+            assert_eq!(page.url_string(), next, "fixed={fixed}");
+            assert_eq!(page.title, "next", "fixed={fixed}");
+            assert!(!page.has_pending_navigation());
+            if fixed {
+                // The landed document keeps the rest of the fixed budget.
+                assert!(started.elapsed() >= std::time::Duration::from_millis(2_900));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_settle_stops_at_a_queued_navigation() {
+        let mut page = page_without_chain_limit("settle-stops-at-navigation");
+        page.navigate("data:text/html,<title>first</title><script>onload=()=>setTimeout(()=>{location.href='data:text/html,next'},50)</script>").await.unwrap();
+        let started = std::time::Instant::now();
+        page.settle_for_duration(3_000).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(2_000));
+        assert!(page.has_pending_navigation());
+        assert_eq!(page.title, "first");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settle_bounds_a_page_that_keeps_navigating() {
+        let mut page = page_without_chain_limit("settle-navigation-storm");
+        page.set_navigation_chain_limit(3);
+        page.navigate("data:text/html,<script>onload=()=>setTimeout(()=>location.reload(),20)</script>").await.unwrap();
+        let error = page.settle_following_navigations(10_000, true).await.unwrap_err();
+        assert!(matches!(error, crate::PageError::TooManyClientNavigations(3)));
+        assert!(!page.has_pending_navigation());
     }
 
     #[tokio::test(flavor = "current_thread")]

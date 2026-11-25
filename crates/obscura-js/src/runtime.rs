@@ -3886,6 +3886,14 @@ impl ObscuraJsRuntime {
     /// the watchdog terminates it. A well-behaved page returns as soon as the
     /// loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        self.run_event_loop_bounded_inner(budget_ms, false).await
+    }
+
+    async fn run_event_loop_bounded_inner(
+        &mut self,
+        budget_ms: u64,
+        stop_on_navigation: bool,
+    ) -> Result<(), String> {
         #[cfg(feature = "render")]
         self.service_render_resources();
         if budget_ms == 0 {
@@ -3910,6 +3918,12 @@ impl ObscuraJsRuntime {
         );
         let result = loop {
             if tokio::time::Instant::now() >= deadline {
+                break Ok(());
+            }
+            // The document asked to be replaced (a timer assigning location,
+            // a reload). Its remaining tasks would run against a page that is
+            // about to go away, so hand the navigation back to the embedder.
+            if stop_on_navigation && self.has_pending_navigation() {
                 break Ok(());
             }
             // Timer-driven page script observes resources that landed during
@@ -3962,7 +3976,7 @@ impl ObscuraJsRuntime {
         if budget_ms == 0 {
             return Ok(());
         }
-        self.run_event_loop_bounded(budget_ms).await
+        self.run_event_loop_bounded_inner(budget_ms, true).await
     }
 
     /// Return after a poll that delivers browser tasks. If the first poll
@@ -4152,6 +4166,10 @@ impl ObscuraJsRuntime {
             let Some(_remaining) = deadline.checked_duration_since(now) else {
                 break Ok(());
             };
+            // A queued document navigation ends readiness for this document.
+            if self.has_pending_navigation() {
+                break Ok(());
+            }
             let next_generation = self.activity_generation();
             // One-shot timers up to two quiet windows away are commonly app
             // hydration/debounce work (`setTimeout(render, 200)`). Intervals
